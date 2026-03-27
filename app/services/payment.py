@@ -10,7 +10,7 @@ from app.schemas.payment import PaymentCreate
 
 
 async def create_payment(session: AsyncSession, data: PaymentCreate, idempotency_key: str) -> Payment:
-    # Сначала проверяем — вдруг такой ключ уже есть (обычный случай при retry от клиента)
+    # Сначала проверяем — вдруг такой ключ уже есть
     existing = await session.scalar(select(Payment).where(Payment.idempotency_key == idempotency_key))
     if existing:
         return existing
@@ -29,7 +29,7 @@ async def create_payment(session: AsyncSession, data: PaymentCreate, idempotency
     # Flush чтобы получить payment.id до создания outbox записи
     await session.flush()
 
-    # Outbox event создаётся в той же транзакции — гарантируем атомарность
+    # Outbox event создаётся в той же транзакции
     outbox_event = OutboxEvent(
         payment_id=payment.id,
         event_type="payment.created",
@@ -45,8 +45,8 @@ async def create_payment(session: AsyncSession, data: PaymentCreate, idempotency
     try:
         await session.commit()
     except IntegrityError:
-        # Гонка: два одновременных запроса с одним ключом — второй проиграл на unique constraint.
-        # Откатываемся и возвращаем то что уже есть.
+        # Гонка: два одновременных запроса с одним ключом — второй проиграл на unique constraint
+        # Откатываемся и возвращаем то что уже есть
         await session.rollback()
         existing = await session.scalar(select(Payment).where(Payment.idempotency_key == idempotency_key))
         return existing

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+import aio_pika
 from faststream import FastStream
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
 from faststream.rabbit.annotations import RabbitMessage
@@ -21,13 +22,12 @@ payments_exchange = RabbitExchange("payments", type=ExchangeType.DIRECT, durable
 retry_exchange = RabbitExchange("payments.retry", type=ExchangeType.DIRECT, durable=True)
 
 dlx = RabbitExchange("payments.dead", type=ExchangeType.FANOUT, durable=True)
-dlq = RabbitQueue("payments.dlq", durable=True, bind_to=dlx)
+dlq = RabbitQueue("payments.dlq", durable=True)
 
 # При финальном nack из основной очереди → DLQ
 payments_queue = RabbitQueue(
     "payments.new",
     durable=True,
-    bind_to=payments_exchange,
     arguments={"x-dead-letter-exchange": "payments.dead"},
 )
 
@@ -74,34 +74,42 @@ async def handle_payment(payload: dict, message: RabbitMessage) -> None:
 @app.on_startup
 async def setup_topology() -> None:
     """
-    Декларируем всю топологию при старте воркера.
-    Порядок важен: exchanges перед очередями, которые на них ссылаются.
+    Декларируем всю топологию через aio-pika до старта брокера FastStream.
+    @app.on_startup запускается до broker.start(), поэтому используем
+    отдельное соединение aio-pika вместо broker.declare_*.
     """
-    await broker.declare_exchange(payments_exchange)
-    await broker.declare_exchange(retry_exchange)
-    await broker.declare_exchange(dlx)
+    connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
+    async with connection:
+        channel = await connection.channel()
 
-    await broker.declare_queue(payments_queue)
+        payments_ex = await channel.declare_exchange("payments", aio_pika.ExchangeType.DIRECT, durable=True)
+        retry_ex = await channel.declare_exchange("payments.retry", aio_pika.ExchangeType.DIRECT, durable=True)
+        dead_ex = await channel.declare_exchange("payments.dead", aio_pika.ExchangeType.FANOUT, durable=True)
 
-    # Retry-очереди с разными TTL — сообщение ждёт, потом возвращается в payments.new
-    for i, delay_ms in enumerate(RETRY_DELAYS_MS, start=1):
-        retry_queue = RabbitQueue(
-            f"payments.retry.{i}",
+        pq = await channel.declare_queue(
+            "payments.new",
             durable=True,
-            bind_to=retry_exchange,
-            routing_key=f"retry.{i}",
-            arguments={
-                "x-message-ttl": delay_ms,
-                "x-dead-letter-exchange": "payments",
-                "x-dead-letter-routing-key": "payments.new",
-            },
+            arguments={"x-dead-letter-exchange": "payments.dead"},
         )
-        await broker.declare_queue(retry_queue)
+        await pq.bind(payments_ex, routing_key="payments.new")
 
-    await broker.declare_queue(dlq)
+        for i, delay_ms in enumerate(RETRY_DELAYS_MS, start=1):
+            rq = await channel.declare_queue(
+                f"payments.retry.{i}",
+                durable=True,
+                arguments={
+                    "x-message-ttl": delay_ms,
+                    "x-dead-letter-exchange": "payments",
+                    "x-dead-letter-routing-key": "payments.new",
+                },
+            )
+            await rq.bind(retry_ex, routing_key=f"retry.{i}")
+
+        dlq_q = await channel.declare_queue("payments.dlq", durable=True)
+        await dlq_q.bind(dead_ex)
 
     logger.info(
-        "Worker started, retry topology configured (%d retries, delays: %s ms)",
+        "Worker topology configured (%d retries, delays: %s ms)",
         MAX_RETRIES, RETRY_DELAYS_MS,
     )
 
